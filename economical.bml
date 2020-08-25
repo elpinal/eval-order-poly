@@ -1,0 +1,338 @@
+module EvalOrder = {
+  module FVar :> {
+    type t
+
+    val fresh : unit -> t
+  } = {
+    type t = int
+
+    module R = Ref.Make {type t = int}
+
+    val counter = R.make 0
+
+    val fresh _ =
+      let
+        val n = R.get counter
+        val _ : unit = R.set counter $ n + 1
+      in
+        n
+  }
+
+  type fvar = FVar.t
+
+  val fresh_var = FVar.fresh
+
+  // Evaluation order.
+  datatype t =
+    | V // call by value
+    | N // call by name
+    | Bound of nat
+    | Free of fvar
+}
+
+datatype valueness =
+  | Val
+  | Top
+
+val join x y =
+  match (x, y) with
+    | (Val, Val) -> Val
+    | _          -> Top
+  end
+
+module Type = {
+  module FVar :> {
+    type t
+
+    val fresh : unit -> t
+  } = {
+    type t = int
+
+    module R = Ref.Make {type t = int}
+
+    val counter = R.make 0
+
+    val fresh _ =
+      let
+        val n = R.get counter
+        val _ : unit = R.set counter $ n + 1
+      in
+        n
+  }
+
+  type fvar = FVar.t
+
+  val fresh_var = FVar.fresh
+
+  datatype t =
+    | Unit
+    | Bound of nat
+    | Free of fvar
+    | Forall of t
+    | D of t
+    | Suspend of EvalOrder.t * t
+    | Arrow of t * t
+    | Prod of t * t
+    | Sum of t * t
+    | Rec of t
+
+  val rec open_at k by =
+    let val iter = open_at k by in
+    function
+      | Unit            -> Unit
+      | Bound i         -> if Nat.`==` i k then by else Bound i
+      | Free fv         -> Free fv
+      | Forall ty       -> Forall $ open_at (Nat.succ k) by ty
+      | D ty            -> D $ iter ty
+      | Suspend(eo, ty) -> Suspend(eo, iter ty)
+      | Arrow(x, y)     -> Arrow(iter x, iter y)
+      | Prod(x, y)      -> Prod(iter x, iter y)
+      | Sum(x, y)       -> Sum(iter x, iter y)
+      | Rec ty          -> Rec $ open_at (Nat.succ k) by ty
+    end
+
+  val r#open = open_at Nat.zero
+
+  module EO = {
+    val rec open_at k by =
+      let val iter = open_at k by in
+      function
+        | Unit            -> Unit
+        | Bound i         -> Bound i
+        | Free fv         -> Free fv
+        | Forall ty       -> Forall $ iter ty
+        | D ty            -> D $ open_at (Nat.succ k) by ty
+        | Arrow(x, y)     -> Arrow(iter x, iter y)
+        | Prod(x, y)      -> Prod(iter x, iter y)
+        | Sum(x, y)       -> Sum(iter x, iter y)
+        | Rec ty          -> Rec $ iter ty
+        | Suspend(eo, ty) ->
+            open EvalOrder in
+            let val eo' =
+              match eo with
+                | Bound i -> if Nat.`==` i k then by else Bound i
+                | _       -> eo
+              end
+            in
+              Suspend(eo', iter ty)
+      end
+
+    val r#open = open_at Nat.zero
+  }
+
+  val equal x y = panic "TODO" // alpha equivalence
+}
+
+module Term = {
+  datatype index =
+    | Fst
+    | Snd
+
+  val index i x y =
+    match i with
+      | Fst -> x
+      | Snd -> y
+    end
+
+  type var = string
+
+  datatype t =
+    | Unit
+    | Var of var
+    | Abs of var * t
+    | App of t * t
+    | Fix of var * t
+    | Gen of t
+    | Inst of t * Type.t
+    | Ascribe of t * Type.t
+    | Pair of t * t
+    | Proj of index * t
+    | Inj of index * t
+    | Case of t * var * t * var * t
+
+  // As to type variables.
+  val rec open_at k by =
+    let val iter = open_at k by in
+    function
+      | Unit           -> Unit
+      | Var v          -> Var v
+      | Abs(v, t)      -> Abs(v, iter t)
+      | App(x, y)      -> App(iter x, iter y)
+      | Fix(v, t)      -> Fix(v, iter t)
+      | Gen t          -> Gen $ open_at (Nat.succ k) by t
+      | Inst(t, ty)    -> Inst(iter t, Type.open_at k by ty)
+      | Ascribe(t, ty) -> Ascribe(iter t, Type.open_at k by ty)
+      | Pair(x, y)     -> Pair(iter x, iter y)
+      | Proj(i, t)     -> Proj(i, iter t)
+      | Inj(i, t)      -> Inj(i, iter t)
+      | Case(x, v1, y, v2, z) -> Case(iter x, v1, iter y, v2, iter z)
+    end
+
+  val r#open = open_at Nat.zero
+}
+
+type term = Term.t
+
+module Env :> {
+  type t
+
+  datatype sort =
+    | Ordinary
+    | Fixpoint
+
+  val lookup : t -> Term.var -> Type.t * sort
+
+  val insert          : t -> Term.var -> Type.t -> t
+  val insert_fixpoint : t -> Term.var -> Type.t -> t
+} = {
+  datatype sort =
+    | Ordinary
+    | Fixpoint
+
+  module M = Map.Make String
+
+  type t = M.t (Type.t * sort)
+
+  val lookup m v = Option.unwrap $ M.lookup v m
+
+  val insert m v ty = M.insert v (ty, Ordinary) m
+  val insert_fixpoint m v ty = M.insert v (ty, Fixpoint) m
+}
+
+type env = Env.t
+
+signature S = {
+  val check : env -> term -> Type.t -> valueness
+  val synthesize : env -> term -> valueness * Type.t
+
+  val after_synth : valueness * Type.t -> valueness * Type.t
+}
+
+include {
+  open Term
+
+  val rec after_synth vn ty exit =
+    match ty with
+      | Type.Suspend(eo, ty') ->
+          match eo with
+            | EvalOrder.V -> after_synth vn ty' exit // Note: but this case is not mandatory.
+            | _           -> after_synth Top ty' exit
+          end
+      | Type.Rec ty' ->
+          // TODO: Of course, contractiveness is needed to ensure termination.
+          after_synth Top (Type.r#open ty ty') exit
+      // TODO: due to lack of principal types, we cannot choose an evaluation order.
+      // | Type.D ty' -> after_synth vn (Type.open_eo _TODO_ ty') exit
+      | _ -> exit vn ty
+    end
+
+  val after_synth (vn, ty) = after_synth vn ty $ fun x y -> (x, y)
+
+  val rec synthesize_aux env = function
+    | Var v ->
+        match Env.lookup env v with
+          | (ty, Env.Ordinary) -> (Val, ty)
+          | (ty, Env.Fixpoint) -> (Top, ty)
+        end
+    | Ascribe(t, ty) -> (check env t ty, ty)
+    | Inst(t, ty) ->
+        let val (vn, ty') = synthesize env t in
+        // let val _ : unit = Type.well_formed ty in
+        match ty' with
+          | Type.Forall ty' -> (vn, Type.r#open ty ty')
+          | _               -> panic "not polymorphic"
+        end
+    | App(x, y) ->
+        let val (_, ty) = synthesize env x in
+        match ty with
+          | Type.Arrow(ty1, ty2) -> let val _ : valueness = check env y ty1 in (Top, ty2)
+          | _ -> panic "function position of application should have arrow type"
+        end
+    | Proj(i, t) ->
+        let val (_, ty) = synthesize env t in
+        match ty with
+          | Type.Prod(ty1, ty2) -> (Top, index i ty1 ty2)
+          | _                   -> panic "projected term should have product type"
+        end
+    | _ -> panic "type error in synthesis mode"
+  end
+
+  and synthesize env t = after_synth $ synthesize_aux env t
+
+  and check env t ty =
+    match ty with
+      | Type.Suspend(eo, ty') ->
+          let val vn = check env t ty' in
+          match eo with
+            | EvalOrder.N -> Val // Note: but this case is not mandatory.
+            | _           -> vn
+          end
+      | Type.D ty' ->
+          match check env t $ Type.EO.r#open (EvalOrder.Free $ EvalOrder.fresh_var ()) ty' with
+            | Val -> Val
+            | _   -> panic "body of evaluation-order polymorphic function must be a value"
+          end
+      | Type.Rec ty' -> check env t $ Type.r#open ty ty'
+      | _            -> check_aux env t ty
+    end
+
+  and check_aux env t ty =
+    match t with
+      | Fix(v, t) ->
+          let val _ : valueness = check_aux (Env.insert_fixpoint env v ty) t ty in
+          Top
+      | Gen t ->
+          match ty with
+            | Type.Forall ty' ->
+                let val fv = Type.Free $ Type.fresh_var () in
+                match check env (Term.r#open fv t) $ Type.r#open fv ty' with
+                  | Val -> Val // Enforce value restriction.
+                  | Top -> panic "body of polymorphic function must be a value"
+                end
+            | _ -> panic "polymorphic function should have universally quantified type"
+          end
+      | Unit ->
+          match ty with
+            | Type.Unit -> Val
+            | _         -> panic "unit value has unit type"
+          end
+      | Abs(v, t) ->
+          match ty with
+            | Type.Arrow(ty1, ty2) ->
+                let val _ : valueness = check (Env.insert env v ty1) t ty2 in
+                Val
+            | _ -> panic "lambda abstractin should have arrow type"
+          end
+      | Pair(x, y) ->
+          match ty with
+            | Type.Prod(ty1, ty2) ->
+                let
+                  val vn1 = check env x ty1
+                  val vn2 = check env y ty2
+                in
+                  join vn1 vn2
+            | _ -> panic "pair should have product type"
+          end
+      | Inj(i, t) ->
+          match ty with
+            | Type.Sum(ty1, ty2) -> check env t $ index i ty1 ty2
+            | _                  -> panic "injection should have sum type"
+          end
+      | Case(x, v1, y, v2, z) ->
+          let val (_, ty') = synthesize env x in
+          match ty' with
+            | Type.Sum(ty1, ty2) ->
+                let
+                  val _ = check_aux (Env.insert env v1 ty1) y ty
+                  val _ = check_aux (Env.insert env v2 ty2) z ty
+                in
+                  Top
+            | _ -> panic "scrutinee should have sum type"
+          end
+      | _ -> // Esub rule
+          let val (vn, ty') = synthesize env t in
+          if Type.equal ty' ty
+          then vn
+          else panic "type error in check mode"
+    end
+} : S
